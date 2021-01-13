@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use clap::{crate_authors, crate_version, Clap};
 use serde::Deserialize;
-use tokio::fs::create_dir_all;
-use tokio_compat_02::FutureExt;
+use tokio::fs::{create_dir_all, symlink_metadata};
+use tokio::process::Command;
 
 /// git clones all repos in a provided BitBucket project to a provided filesystem destination.
 ///
@@ -46,6 +46,13 @@ struct BitBucketRepoLink {
 
 static BITBUCKET_ACCESS_TOKEN_ENV_VAR_NAME: &str = "BITBUCKET_ACCESS_TOKEN";
 
+#[derive(Debug)]
+enum RepoActionState {
+    ShouldClone,
+    AlreadyCloned,
+    CannotClone(std::io::Error),
+}
+
 fn get_access_token() -> Option<String> {
     match env::var(BITBUCKET_ACCESS_TOKEN_ENV_VAR_NAME) {
         Ok(token) => Option::Some(token),
@@ -68,7 +75,6 @@ async fn get_project_repos<T: AsRef<str>>(
         ))
         .bearer_auth(access_token.as_ref())
         .send()
-        .compat()
         .await?
         .json::<BitBucketRepoListResult>()
         .await?;
@@ -127,10 +133,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("There are {} {} repos", resp.size, &opts.bitbucket_project);
     println!("-----\n");
     for repo in resp.repos {
-        match get_clone_link_for_repo(&repo) {
-            Some(link) => println!("Link for {}: {}", repo.name, link),
-            None => println!("Repo {} has no clone link", repo.name),
+        use RepoActionState::*;
+        let repo_state = match symlink_metadata(&repo.slug).await {
+            Ok(metadata) => {
+                if metadata.is_dir() {
+                    AlreadyCloned
+                } else {
+                    CannotClone(
+                        std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists, "{} exists on filesystem but is not a directory"
+                        )
+                    )
+                }
+            },
+            Err(e) => {
+                match e.kind() {
+                    std::io::ErrorKind::NotFound => ShouldClone,
+                    _ => CannotClone(e),
+                }
+            }
         };
+
+        match repo_state {
+            RepoActionState::CannotClone(e) => {
+                eprintln!("Cannot clone {} at {}: {}", &repo.name, &repo.slug, e);
+                continue;
+            },
+            RepoActionState::ShouldClone => {
+                let repo_link = match get_clone_link_for_repo(&repo) {
+                    Some(link) => link,
+                    None => {
+                        println!("Repo {} has no clone link", &repo.name);
+                        continue;
+                    }
+                };
+                let mut child = match Command::new("git").arg("clone").arg(&repo_link).spawn() {
+                    Ok(child) => child,
+                    Err(e) => {
+                        eprintln!("Failed to execute 'git clone {}': {}", &repo_link, e);
+                        continue;
+                    }
+                };
+                match child.wait().await {
+                    Ok(status) => match status.code() {
+                        Some(code) if code != 0 => eprintln!("'git clone {}' failed with exit code {}", &repo_link, code),
+                        Some(_) => (),
+                        None => eprintln!("'git clone {}' was terminated by a signal", &repo_link)
+                    },
+                    Err(e) => {
+                        eprintln!("Failed to execute 'git clone {}': {}", &repo_link, e);
+                    }
+                }
+            },
+            RepoActionState::AlreadyCloned => (),
+        }
     }
 
     env::set_current_dir(orig_curr_dir)?;

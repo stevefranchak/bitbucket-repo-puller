@@ -114,6 +114,7 @@ fn remember_and_set_current_dir<T: AsRef<str>>(path: T) -> PathBuf {
     orig_curr_dir
 }
 
+// TODO: this needs a lot of refactoring - does the job for now though
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts = Opts::parse();
@@ -132,23 +133,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("There are {} {} repos", resp.size, &opts.bitbucket_project);
     println!("-----\n");
+
     for repo in resp.repos {
+        use std::io::{Error, ErrorKind};
         use RepoActionState::*;
+
         let repo_state = match symlink_metadata(&repo.slug).await {
             Ok(metadata) => {
                 if metadata.is_dir() {
                     AlreadyCloned
                 } else {
                     CannotClone(
-                        std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists, "{} exists on filesystem but is not a directory"
+                        Error::new(
+                            ErrorKind::AlreadyExists, "{} exists on filesystem but is not a directory"
                         )
                     )
                 }
             },
             Err(e) => {
                 match e.kind() {
-                    std::io::ErrorKind::NotFound => ShouldClone,
+                    ErrorKind::NotFound => ShouldClone,
                     _ => CannotClone(e),
                 }
             }
@@ -185,8 +189,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             },
-            RepoActionState::AlreadyCloned => (),
+            RepoActionState::AlreadyCloned => println!("{} ({}) is already cloned", &repo.name, &repo.slug),
         }
+
+        env::set_current_dir(&repo.slug)?;
+
+        let for_each_ref_output = match Command::new("git")
+            .arg("for-each-ref")
+            .arg("--sort=-committerdate")
+            .arg("refs/remotes/origin")
+            .arg("--format=%(refname:short)|%(committerdate)")
+            .output()
+            .await {
+                Ok(output) => output,
+                Err(e) => {
+                    eprintln!("Failed to execute 'git for-each-ref': {}", e);
+                    continue;
+                }
+            };
+
+        // TODO: better handle error cases
+        // TODO: use a tuple struct for the split line
+        let mut filtered_output = std::str::from_utf8(&for_each_ref_output.stdout)?
+            .lines()
+            .map(|line| {
+                let mut split_line = line.split("|");
+                (split_line.next().unwrap().strip_prefix("origin/").unwrap(), split_line.next().unwrap())
+            })
+            .filter(|tuple| tuple.0 != "HEAD");
+
+        if let Some(tuple) = filtered_output.next() {
+            println!("Checking out branch '{}' ({}) for repo {}", &tuple.0, &tuple.1, &repo.slug);
+            // TODO: make a function or macro
+            // TODO: prefer 'git switch' if the installed git supports it
+            let mut child = match Command::new("git").arg("checkout").arg(&tuple.0).spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    eprintln!("Failed to execute 'git checkout {}': {}", &tuple.0, e);
+                    continue;
+                }
+            };
+            match child.wait().await {
+                Ok(status) => match status.code() {
+                    Some(code) if code != 0 => eprintln!("'git checkout {}' failed with exit code {}", &tuple.0, code),
+                    Some(_) => (),
+                    None => eprintln!("'git checkout {}' was terminated by a signal", &tuple.0)
+                },
+                Err(e) => {
+                    eprintln!("Failed to execute 'git checkout {}': {}", &tuple.0, e);
+                }
+            }
+            let mut child = match Command::new("git").arg("pull").spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    eprintln!("Failed to execute 'git pull': {}", e);
+                    continue;
+                }
+            };
+            match child.wait().await {
+                Ok(status) => match status.code() {
+                    Some(code) if code != 0 => eprintln!("'git pull' failed with exit code {}", code),
+                    Some(_) => (),
+                    None => eprintln!("'git pull' was terminated by a signal")
+                },
+                Err(e) => {
+                    eprintln!("Failed to execute 'git pull': {}", e);
+                }
+            }
+        }
+
+        env::set_current_dir(&opts.target_directory)?;
     }
 
     env::set_current_dir(orig_curr_dir)?;

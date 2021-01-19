@@ -134,7 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("There are {} {} repos", resp.size, &opts.bitbucket_project);
     println!("-----\n");
 
-    for repo in resp.repos {
+    for (repo_index, repo) in resp.repos.iter().enumerate() {
         use std::io::{Error, ErrorKind};
         use RepoActionState::*;
 
@@ -256,6 +256,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Failed to execute 'git pull': {}", e);
                 }
             }
+        }
+
+        if repo_index != resp.size - 1 {
+            println!("-----");
         }
 
         env::set_current_dir(&opts.target_directory)?;
